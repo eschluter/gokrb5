@@ -8,47 +8,68 @@ import (
 	"gopkg.in/jcmturner/gokrb5.v2/messages"
 	"math/rand"
 	"net"
+	"strings"
 	"time"
 )
+
+// cache the kdc addresses
+var KdcDns = make(map[string]string)
 
 // SendToKDC performs network actions to send data to the KDC.
 func (cl *Client) SendToKDC(b []byte, realm string) ([]byte, error) {
 	var rb []byte
-	var kdcs []string
-	for _, r := range cl.Config.Realms {
-		if r.Realm == realm {
-			kdcs = r.KDC
-			break
+	var kdcTCP string
+	var kdcUDP string
+	// check for dns lookup
+	if cl.Config.LibDefaults.DNSLookupKDC {
+		var err error
+		kdcTCP, err = getKDC("tcp", realm)
+		if err != nil {
+			return rb, err
 		}
-	}
-	if len(kdcs) < 1 {
-		return rb, fmt.Errorf("No KDCs defined in configuration for realm: %v", cl.Config.LibDefaults.DefaultRealm)
-	}
-	var kdc string
-	if len(kdcs) > 1 {
-		//Select one of the KDCs at random
-		kdc = kdcs[rand.Intn(len(kdcs))]
+		kdcUDP, err = getKDC("udp", realm)
+		if err != nil {
+			return rb, err
+		}
 	} else {
-		kdc = kdcs[0]
+		var kdcs []string
+		for _, r := range cl.Config.Realms {
+			if r.Realm == realm {
+				kdcs = r.KDC
+				break
+			}
+		}
+		if len(kdcs) < 1 {
+			return rb, fmt.Errorf("No KDCs defined in configuration for realm: %v", cl.Config.LibDefaults.DefaultRealm)
+		}
+		var kdc string
+		if len(kdcs) > 1 {
+			//Select one of the KDCs at random
+			kdc = kdcs[rand.Intn(len(kdcs))]
+		} else {
+			kdc = kdcs[0]
+		}
+		kdcTCP = kdc
+		kdcUDP = kdc
 	}
 
 	if cl.Config.LibDefaults.UDPPreferenceLimit == 1 {
 		//1 means we should always use TCP
-		rb, errtcp := sendTCP(kdc, b)
+		rb, errtcp := sendTCP(kdcTCP, b)
 		if errtcp != nil {
 			if e, ok := errtcp.(messages.KRBError); ok {
 				return rb, e
 			}
-			return rb, fmt.Errorf("Failed to communicate with KDC %v via TCP (%v)", kdc, errtcp)
+			return rb, fmt.Errorf("Failed to communicate with KDC %v via TCP (%v)", kdcTCP, errtcp)
 		}
 		if len(rb) < 1 {
-			return rb, fmt.Errorf("No response data from KDC %v", kdc)
+			return rb, fmt.Errorf("No response data from KDC %v", kdcTCP)
 		}
 		return rb, nil
 	}
 	if len(b) <= cl.Config.LibDefaults.UDPPreferenceLimit {
 		//Try UDP first, TCP second
-		rb, errudp := sendUDP(kdc, b)
+		rb, errudp := sendUDP(kdcUDP, b)
 		if errudp != nil {
 			if e, ok := errudp.(messages.KRBError); ok && e.ErrorCode != errorcode.KRB_ERR_RESPONSE_TOO_BIG {
 				// Got a KRBError from KDC
@@ -56,39 +77,39 @@ func (cl *Client) SendToKDC(b []byte, realm string) ([]byte, error) {
 				return rb, e
 			}
 			// Try TCP
-			r, errtcp := sendTCP(kdc, b)
+			r, errtcp := sendTCP(kdcTCP, b)
 			if errtcp != nil {
 				if e, ok := errtcp.(messages.KRBError); ok {
 					// Got a KRBError
 					return r, e
 				}
-				return r, fmt.Errorf("Failed to communicate with KDC %v. Attempts made with UDP (%v) and then TCP (%v)", kdc, errudp, errtcp)
+				return r, fmt.Errorf("Failed to communicate with KDC %v and %v. Attempts made with UDP (%v) and then TCP (%v)", kdcTCP, kdcUDP, errudp, errtcp)
 			}
 			rb = r
 		}
 		if len(rb) < 1 {
-			return rb, fmt.Errorf("No response data from KDC %v", kdc)
+			return rb, fmt.Errorf("No response data from KDC %v", kdcUDP)
 		}
 		return rb, nil
 	}
 	//Try TCP first, UDP second
-	rb, errtcp := sendTCP(kdc, b)
+	rb, errtcp := sendTCP(kdcTCP, b)
 	if errtcp != nil {
 		if e, ok := errtcp.(messages.KRBError); ok {
 			// Got a KRBError from KDC so returning and not trying UDP.
 			return rb, e
 		}
-		rb, errudp := sendUDP(kdc, b)
+		rb, errudp := sendUDP(kdcUDP, b)
 		if errudp != nil {
 			if e, ok := errudp.(messages.KRBError); ok {
 				// Got a KRBError
 				return rb, e
 			}
-			return rb, fmt.Errorf("Failed to communicate with KDC %v. Attempts made with TCP (%v) and then UDP (%v)", kdc, errtcp, errudp)
+			return rb, fmt.Errorf("Failed to communicate with KDC %v and %v. Attempts made with TCP (%v) and then UDP (%v)", kdcTCP, kdcUDP, errtcp, errudp)
 		}
 	}
 	if len(rb) < 1 {
-		return rb, fmt.Errorf("No response data from KDC %v", kdc)
+		return rb, fmt.Errorf("No response data from KDC %v", kdcTCP)
 	}
 	return rb, nil
 }
@@ -168,6 +189,19 @@ func sendTCP(kdc string, b []byte) ([]byte, error) {
 	}
 
 	return checkForKRBError(rb)
+}
+
+// Lookup KDC dns name for the given realm
+func getKDC(protocol, realm string) (string, error) {
+	if _, ok := KdcDns[protocol]; !ok {
+		_, kdcs, err := net.LookupSRV("kerberos", protocol, realm)
+		if err != nil {
+			return "", fmt.Errorf("Could not lookup kdc: %v", err)
+		}
+		// LookupSRV sorts the results for us based on priority so just take the top result
+		KdcDns[protocol] = fmt.Sprintf("%s:%d", strings.Trim(kdcs[0].Target, "."), kdcs[0].Port)
+	}
+	return KdcDns[protocol], nil
 }
 
 func checkForKRBError(b []byte) ([]byte, error) {
